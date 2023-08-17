@@ -24,3 +24,5 @@
 /config/database.yml
 
 .env.docker
+/bin/console
+/bin/dbconsole
