@@ -1,0 +1,477 @@
+#!/usr/bin/env ruby
+
+if not defined?(Rails) then
+  exec("rails", "runner", File.expand_path(__FILE__), *ARGV)
+end
+
+options = {
+  organization_count: 500,
+  patient_count_range: 10..2000,
+  eligibility_count_range: 0..6000,
+  campaign_count_range: 1..5,
+  event_count_range: 10..50,
+  location_count: 123,
+  location_latitude_range: 24.521208..49.382808,
+  location_longitude_range: -124.736342..-66.945392,
+  onsite_percentage: 0.5,
+  onsite_session_range: 1..3,
+  offsite_percentage: 0.3,
+  event_lookback: 180,
+  event_lookahead: 90,
+  onsite_timeslot_fill_percentage: 0.75,
+  appointments_with_results_percentage: 0.9,
+  missing_results_percentage: 0.03,
+}
+
+measurements = [
+  {
+    name: 'Height',
+    range: 48..84,
+  },
+  {
+    name: 'Weight',
+    range: 100..300,
+  },
+  {
+    name: 'Waist',
+    range: 30..60,
+  },
+  {
+    name: 'Glucose',
+    range: 70..130,
+  },
+  {
+    name: 'HDL',
+    range: 40..60,
+  },
+  {
+    name: 'LDL',
+    range: 100..200,
+  },
+  {
+    name: 'Triglycerides',
+    range: 100..200,
+  },
+  {
+    name: 'Total Cholesterol',
+    range: 100..200,
+  },
+  {
+    name: 'Blood Pressure - Systolic',
+    range: 100..200,
+  },
+  {
+    name: 'Blood Pressure - Diastolic',
+    range: 60..100,
+  }
+]
+
+measurement_records = measurements.each_with_object({}) { |template, o|
+  name = template[:name]
+  o[Measurement.where(name:).first_or_create!.id] = template[:range]
+}
+
+mrn_prefix = [
+  OnsiteAppointment.maximum("split_part(medical_record_number, '-', 1)::integer"),
+  OffsiteAppointment.maximum("split_part(medical_record_number, '-', 1)::integer"),
+  HomeTestKit.maximum("split_part(medical_record_number, '-', 1)::integer"),
+].compact.max.to_i + 1
+
+print "#{options[:organization_count]}: "
+options[:organization_count].times do |organization_index|
+  begin
+    ActiveRecord::Base.transaction do
+      campaign_count = rand(options[:campaign_count_range])
+      organization = Organization.where(name: Faker::Company.name).first_or_create!(created_at: campaign_count.years.ago)
+      AuditEvent.create!(organization:, action: 'Organization Created', audit_data: {
+        name: organization.name,
+        ip: Faker::Internet.ip_v4_address
+      }, created_at: organization.created_at)
+      patient_count = rand(options[:patient_count_range])
+      eligibility_count = [patient_count, rand(options[:eligibility_count_range])].max
+      patients = patient_count.times.map {
+        Patient.create!(
+          organization_id: organization.id,
+          first_name: Faker::Name.first_name,
+          last_name: Faker::Name.last_name,
+          gender: %w[m f].sample,
+          date_of_birth: Faker::Date.birthday(min_age: 18, max_age: 65),
+          created_at: Faker::Date.between(from: campaign_count.years.ago, to: Time.current),
+        ).tap do |patient|
+          AuditEvent.create!(organization:, action: 'Patient Created', audit_data: {
+            full_name: [patient.first_name, patient.last_name].join(' '),
+            ip: Faker::Internet.ip_v4_address,
+          }, created_at: patient.created_at)
+          AuditEvent.create!(organization:, action: 'Patient Updated', audit_data: {
+            full_name: [patient.first_name, patient.last_name].join(' '),
+            from: {
+              first_name: patient.first_name.downcase,
+            },
+            to: {
+              first_name: patient.first_name,
+            },
+          }, created_at: patient.created_at)
+          extras = {
+            tpa: ['Cigna', 'Aetna', 'BCBS', 'UHC', 'Humana', 'Kaiser', nil, nil, nil, nil, nil].sample,
+            plan: ['Gold', 'Silver', 'Bronze', nil].sample,
+            hire_date: rand < 0.5 ? Faker::Date.between(from: 5.years.ago, to: 30.days.ago) : nil,
+          }.compact
+          extras.delete(:plan) unless extras[:tpa]
+          EligibilityRecord.create!(
+            organization_id: organization.id,
+            patient_id: patient.id,
+            first_name: patient.first_name,
+            last_name: patient.last_name,
+            gender: patient.gender,
+            date_of_birth: patient.date_of_birth,
+            extras:,
+            created_at: patient.created_at,
+          ).tap do |eligibility_record|
+            AuditEvent.create!(organization:, action: 'Eligibility Record Created', audit_data: {
+              full_name: [eligibility_record.first_name, eligibility_record.last_name].join(' '),
+            }, created_at: eligibility_record.created_at)
+          end
+        end
+      }.shuffle
+
+      ## Unassociated Eligibility Records
+      [eligibility_count - patient_count, 0].max.times do
+        extras = {
+          tpa: ['Cigna', 'Aetna', 'BCBS', 'UHC', 'Humana', 'Kaiser', nil, nil, nil, nil, nil].sample,
+          plan: ['Gold', 'Silver', 'Bronze', nil].sample,
+          hire_date: rand < 0.5 ? Faker::Date.between(from: 5.years.ago, to: 30.days.ago) : nil,
+        }.compact
+        extras.delete(:plan) unless extras[:tpa]
+        EligibilityRecord.create!(
+          organization_id: organization.id,
+          first_name: Faker::Name.first_name,
+          last_name: Faker::Name.last_name,
+          gender: %w[m f u].sample,
+          date_of_birth: Faker::Date.birthday(min_age: 18, max_age: 65),
+          extras:,
+          created_at: Faker::Date.between(from: campaign_count.years.ago, to: Time.current),
+        ).tap do |eligibility_record|
+          AuditEvent.create!(organization:, action: 'Eligibility Record Created', audit_data: {
+            full_name: [eligibility_record.first_name, eligibility_record.last_name].join(' '),
+          }, created_at: eligibility_record.created_at)
+        end
+      end
+
+      ## Locations
+      options[:location_count].times do
+        latitude = rand(options[:location_latitude_range])
+        longitude = rand(options[:location_longitude_range])
+        location = Location.where(
+          organization_id: organization.id,
+          name: Faker::Company.name,
+        ).first_or_create!(
+          latitude:,
+          longitude:,
+          coordinates: [longitude, latitude],
+          created_at: organization.created_at,
+        ).tap do |location|
+          AuditEvent.create!(organization:, action: 'Location Created', audit_data: {
+            name: location.name,
+          }, created_at: location.created_at)
+          AuditEvent.create!(organization:, action: 'Location Updated', audit_data: {
+            name: location.name,
+            from: {
+              latitude: latitude - 0.5,
+              longitude: longitude - 0.5,
+            },
+            to: {
+              latitude: latitude,
+              longitude: longitude,
+            },
+          }, created_at: Faker::Date.between(from: campaign_count.years.ago, to: Time.current))
+        end
+      end
+
+      ## Campaigns
+      campaign_count.times do |campaign_index|
+        campaign_offset = campaign_count - campaign_index - 1
+        campaign = Campaign.where(
+          organization_id: organization.id,
+          name: "#{Faker::Company.name} Campaign",
+        ).first_or_create!(
+          created_at: campaign_offset.years.ago,
+        )
+        AuditEvent.create!(organization:, action: 'Campaign Created', audit_data: {
+          name: campaign.name,
+        }, created_at: campaign.created_at)
+        AuditEvent.create!(organization:, action: 'Campaign Updated', audit_data: {
+          name: campaign.name,
+          from: {
+            name: campaign.name.downcase,
+          },
+          to: {
+            name: campaign.name,
+          },
+        }, created_at: Faker::Date.between(from: campaign_offset.years.ago, to: Time.current))
+
+        event_count = rand(options[:event_count_range])
+
+        ## Offsite Events
+        offsite_event_count = (event_count * options[:offsite_percentage]).to_i
+        offsite_event_count.times do
+          mrn_suffix = 1
+          start_date = Faker::Date.between(from: options[:event_lookback].days.ago, to: options[:event_lookahead].days.from_now) - campaign_offset.years
+          event = Event.where(
+            campaign:,
+            name: "Offsite #{"#{Faker::Company.name}"} Campaign",
+          ).first_or_create!(
+            created_at: campaign.created_at,
+          )
+          AuditEvent.create!(organization:, action: 'Event Created', audit_data: {
+            name: event.name,
+          }, created_at: event.created_at)
+          AuditEvent.create!(organization:, action: 'Event Updated', audit_data: {
+            name: event.name,
+            from: {
+              name: event.name.downcase,
+            },
+            to: {
+              name: event.name,
+            },
+          }, created_at: Faker::Date.between(from: event.created_at, to: Time.current))
+
+          (patients.size / offsite_event_count / 2).times do
+            medical_record_number = "%05d-%05d" % [mrn_prefix, mrn_suffix]
+            mrn_suffix += 1
+            patient = patients.shift
+            appointment = OffsiteAppointment.create!(
+              event:,
+              patient:,
+              medical_record_number:,
+              created_at: event.created_at + mrn_suffix.days,
+            )
+            AuditEvent.create!(organization:, action: 'Appointment Created', audit_data: {
+              patient_name: [patient.first_name, patient.last_name].join(' '),
+              type: 'Offsite',
+              medical_record_number:,
+            }, created_at: appointment.created_at)
+
+            if rand < options[:appointments_with_results_percentage] then
+              result_set = ResultSet.create!(
+                patient:,
+                medical_record_number:,
+                created_at: Faker::Date.between(from: appointment.created_at, to: appointment.created_at + 180.days)
+              )
+              AuditEvent.create!(organization:, action: 'Result Set Created', audit_data: {
+                patient_name: [patient.first_name, patient.last_name].join(' '),
+                medical_record_number:,
+              }, created_at: result_set.created_at)
+              measurement_records.each do |measurement_id, measurement_range|
+                if rand >= options[:missing_results_percentage] then
+                  result = Result.create!(
+                    result_set:,
+                    measurement_id:,
+                    value: rand(measurement_range),
+                    created_at: result_set.created_at,
+                  )
+                  AuditEvent.create!(organization:, action: 'Result Created', audit_data: {
+                    medical_record_number:,
+                    measurement_id:,
+                  }, created_at: result.created_at)
+                end
+              end
+            end
+          end
+          mrn_prefix += 1
+        end
+
+        ## Home Test Kit Events
+        home_test_kit_event_count = (event_count * (1 - options[:onsite_percentage] - options[:offsite_percentage])).to_i
+        home_test_kit_event_count.times do
+          mrn_suffix = 1
+          event = Event.where(
+            campaign:,
+            name: "Home Test Kit #{"#{Faker::Company.name}"} Campaign",
+          ).first_or_create!(
+            created_at: campaign.created_at,
+          )
+          AuditEvent.create!(organization:, action: 'Event Created', audit_data: {
+            name: event.name,
+          }, created_at: event.created_at)
+
+          (patients.count / home_test_kit_event_count / 2).times do
+            medical_record_number = "%05d-%05d" % [mrn_prefix, mrn_suffix]
+            mrn_suffix += 1
+            patient = patients.shift
+            status = HomeTestKit::STATUSES.sample
+            appointment = HomeTestKit.create!(
+              event:,
+              patient:,
+              medical_record_number:,
+              status:,
+              tracking_number: (Faker::Number.between(from: 700_000_000_000, to: 800_000_000_000) if status != 'pending'),
+              created_at: Faker::Date.between(from: event.created_at, to: event.created_at + 180.days),
+            )
+            AuditEvent.create!(organization:, action: 'Appointment Created', audit_data: {
+              patient_name: [patient.first_name, patient.last_name].join(' '),
+              type: 'Home Test Kit',
+              medical_record_number:,
+            }, created_at: event.created_at)
+
+            if rand < options[:appointments_with_results_percentage] then
+              result_set = ResultSet.create!(
+                patient:,
+                medical_record_number:,
+                created_at: Faker::Date.between(from: appointment.created_at, to: appointment.created_at + 180.days)
+              )
+              AuditEvent.create!(organization:, action: 'Result Set Created', audit_data: {
+                patient_name: [patient.first_name, patient.last_name].join(' '),
+                medical_record_number:,
+              }, created_at: result_set.created_at)
+              measurement_records.each do |measurement_id, measurement_range|
+                if rand >= options[:missing_results_percentage] then
+                  result = Result.create!(
+                    result_set:,
+                    measurement_id:,
+                    value: rand(measurement_range),
+                    created_at: result_set.created_at,
+                  )
+                  AuditEvent.create!(organization:, action: 'Result Created', audit_data: {
+                    medical_record_number:,
+                    measurement_id:,
+                  }, created_at: result.created_at)
+                end
+              end
+            end
+          end
+          mrn_prefix += 1
+        end
+
+        ## Onsite Events
+        (event_count * options[:onsite_percentage]).to_i.times do
+          start_date = Faker::Date.between(from: options[:event_lookback].days.ago, to: options[:event_lookahead].days.from_now) - campaign_offset.years
+          location = Location.where(organization_id: organization.id).sample
+          event = Event.where(
+            campaign:,
+            name: "Onsite #{"#{Faker::Company.name}"} Campaign",
+          ).first_or_create!(
+            created_at: campaign.created_at,
+          )
+          AuditEvent.create!(organization:, action: 'Event Created', audit_data: {
+            name: event.name,
+          }, created_at: event.created_at)
+          AuditEvent.create!(organization:, action: 'Event Updated', audit_data: {
+            name: event.name,
+            from: {
+              name: event.name.downcase,
+            },
+            to: {
+              name: event.name,
+            },
+          }, created_at: event.created_at + 1.day)
+
+
+          ## Onsite Event Sessions
+          rand(options[:onsite_session_range]).times do |session_index|
+            mrn_suffix = 1
+            starts_at = start_date + session_index.days + rand(18).hours
+            ends_at = starts_at + rand(6).hours
+            session = EventSession.create!(
+              event:,
+              location:,
+              starts_at:,
+              ends_at:,
+              created_at: event.created_at,
+            )
+            AuditEvent.create!(organization:, action: 'Event Session Created', audit_data: {
+              name: event.name,
+              location: location.name,
+              starts_at: session.starts_at,
+              ends_at: session.ends_at,
+            }, created_at: session.created_at)
+            AuditEvent.create!(organization:, action: 'Event Session Updated', audit_data: {
+              name: event.name,
+              from: {
+                location: location.name.downcase,
+              },
+              to: {
+                location: location.name,
+              },
+            }, created_at: session.created_at + 1.day)
+
+            t = starts_at
+            while t < ends_at do
+              timeslot = Timeslot.create!(
+                event_session_id: session.id,
+                starts_at: t,
+                capacity: rand(2) + 1,
+                created_at: session.created_at,
+              )
+              AuditEvent.create!(organization:, action: 'Timeslot Created', audit_data: {
+                event: event.name,
+                session_start: session.starts_at,
+                starts_at: timeslot.starts_at,
+                capacity: timeslot.capacity,
+              }, created_at: timeslot.created_at)
+              AuditEvent.create!(organization:, action: 'Timeslot Updated', audit_data: {
+                event: event.name,
+                from: {
+                  capacity: timeslot.capacity + 1,
+                },
+                to: {
+                  capacity: timeslot.capacity,
+                },
+              }, created_at: timeslot.created_at + 1.day)
+
+              if rand < options[:onsite_timeslot_fill_percentage] && !patients.empty? then
+                medical_record_number = "%05d-%05d" % [mrn_prefix, mrn_suffix]
+                mrn_suffix += 1
+                patient = patients.shift
+                appointment = OnsiteAppointment.create!(
+                  timeslot:,
+                  patient:,
+                  medical_record_number:,
+                  created_at: Faker::Date.between(from: timeslot.starts_at - 180.days, to: timeslot.starts_at)
+                )
+                AuditEvent.create!(organization:, action: 'Appointment Created', audit_data: {
+                  patient_name: [patient.first_name, patient.last_name].join(' '),
+                  type: 'Onsite',
+                  medical_record_number:,
+                }, created_at: appointment.created_at)
+
+                if rand < options[:appointments_with_results_percentage] then
+                  result_set = ResultSet.create!(
+                    patient:,
+                    medical_record_number:,
+                    created_at: Faker::Date.between(from: appointment.created_at, to: appointment.created_at + 180.days)
+                  )
+                  AuditEvent.create!(organization:, action: 'Result Set Created', audit_data: {
+                    patient_name: [patient.first_name, patient.last_name].join(' '),
+                    medical_record_number:,
+                  }, created_at: result_set.created_at)
+
+                  measurement_records.each do |measurement_id, measurement_range|
+                    if rand >= options[:missing_results_percentage] then
+                      result = Result.create!(
+                        result_set:,
+                        measurement_id:,
+                        value: rand(measurement_range),
+                        created_at: result_set.created_at,
+                      )
+                      AuditEvent.create!(organization:, action: 'Result Created', audit_data: {
+                        medical_record_number:,
+                        measurement_id:,
+                      }, created_at: result.created_at)
+                    end
+                  end
+                end
+              end
+
+              t += 15.minutes
+            end
+            mrn_prefix += 1
+          end
+        end
+      end
+    end
+    print "\e[32m✔\e[0m"
+  rescue
+    print "\e[31m✘\e[0m"
+  end
+end
+puts
